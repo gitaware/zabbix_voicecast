@@ -1,0 +1,111 @@
+zabbix_export:
+  version: '7.0'
+  media_types:
+    - name: VoiceCast
+      type: WEBHOOK
+      status: DISABLED
+      max_sessions: '1'
+      attempts: '1'
+      timeout: 30s
+      parameters:
+        - name: URL
+          value: '{$VOICECAST.URL}'
+        - name: APIKey
+          value: '{$VOICECAST.API.KEY}'
+        - name: Callflow
+          value: '{$VOICECAST.CALLFLOW}'
+        - name: To
+          value: '{ALERT.SENDTO}'
+        - name: Message
+          value: '{ALERT.MESSAGE}'
+      script: |
+        var params;
+        try {
+            params = JSON.parse(value);
+        }
+        catch (error) {
+            throw 'VoiceCast: invalid webhook parameter JSON.';
+        }
+        if (!params || typeof params !== 'object' || Array.isArray(params)) {
+            throw 'VoiceCast: expected a parameter object.';
+        }
+        function required(name) {
+            var text = params[name];
+            if (typeof text !== 'string' || text.trim() === '' || /^\{[^{}]+\}$/.test(text.trim())) {
+                throw 'VoiceCast: configure ' + name + ' (empty or unresolved macro).';
+            }
+            return text.trim();
+        }
+        var url = required('URL').replace(/\/+$/, ''),
+            token = required('APIKey'),
+            flow = required('Callflow'),
+            to = required('To'),
+            message = required('Message'),
+            uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!/^https:\/\/[^\s\/?#@]+(?:\/[^\s?#]*)?$/.test(url)) {
+            throw 'VoiceCast: URL must be an HTTPS application base URL without credentials, query or fragment.';
+        }
+        if (/\/api(?:\/|$)/i.test(url)) {
+            throw 'VoiceCast: URL must be the application base URL, without /api.';
+        }
+        if (/[\r\n]/.test(token)) {
+            throw 'VoiceCast: APIKey contains an invalid newline.';
+        }
+        if (!uuidPattern.test(flow)) {
+            throw 'VoiceCast: Callflow must be a callflow UUID.';
+        }
+        if (!/^\+[1-9][0-9]{6,14}$/.test(to)) {
+            throw 'VoiceCast: To must contain one international phone number, for example +31612345678.';
+        }
+        var payload = {
+            callee: to,
+            callflow: flow,
+            // An explicit date queues the call; omitting it executes synchronously.
+            calldate: new Date().toISOString(),
+            parameters: {
+                message: message,
+                alert_text: message,
+                source: 'zabbix'
+            }
+        }, request, response, status;
+        try {
+            request = new HttpRequest();
+            request.addHeader('Content-Type: application/json');
+            request.addHeader('Authorization: Bearer ' + token);
+            if (typeof params.HTTPProxy === 'string' && params.HTTPProxy.trim() !== '') {
+                request.setProxy(params.HTTPProxy.trim());
+            }
+            response = request.post(url + '/api/call/v2', JSON.stringify(payload));
+            status = request.getStatus();
+        }
+        catch (error) {
+            // Transport errors can contain credentials/URLs; do not echo them.
+            throw 'VoiceCast: HTTP request failed. Check connectivity, TLS and proxy settings; check Calls v2 before retrying.';
+        }
+        if (status !== 201) {
+            throw 'VoiceCast: API returned HTTP ' + status + '. Check credentials, tenant URL and callflow; check Calls v2 before retrying.';
+        }
+        try {
+            response = JSON.parse(response);
+        }
+        catch (error) {
+            throw 'VoiceCast: invalid API response. Check Calls v2 before retrying.';
+        }
+        if (!response || response.success !== true || !response.data ||
+                typeof response.data.call_uuid !== 'string' || !uuidPattern.test(response.data.call_uuid)) {
+            throw 'VoiceCast: API did not confirm call creation. Check Calls v2 before retrying.';
+        }
+        return 'Queued VoiceCast call ' + response.data.call_uuid;
+      description: |
+        Queue a VoiceCast call using a tenant API key and callflow.
+        Set VOICECAST.URL, VOICECAST.API.KEY and VOICECAST.CALLFLOW global macros.
+        Set the user's Send to field to one international phone number.
+        Requires the VoiceCast call dispatcher. See zabbix/README.md.
+        Success means queued, not answered. One attempt prevents automatic duplicate calls.
+      message_templates:
+        - event_source: TRIGGERS
+          operation_mode: PROBLEM
+          message: 'Zabbix problem: {EVENT.NAME}. Host {HOST.NAME}. Severity {EVENT.SEVERITY}. Problem began at {EVENT.TIME} on {EVENT.DATE}.'
+        - event_source: TRIGGERS
+          operation_mode: RECOVERY
+          message: 'Zabbix recovery: {EVENT.NAME}. Host {HOST.NAME} has recovered. Problem duration {EVENT.DURATION}.'
